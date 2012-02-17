@@ -22,6 +22,8 @@
  *	Christopher Li, 2002
  *  Hash Tree Directory indexing cleanup
  *	Theodore Ts'o, 2002
+ *  UTF-8 file name restriction
+ *	Martin v. Löwis, 2012
  */
 
 #include <linux/fs.h>
@@ -179,6 +181,81 @@ static struct buffer_head * ext4_dx_find_entry(struct inode *dir,
 		int *err);
 static int ext4_dx_add_entry(handle_t *handle, struct dentry *dentry,
 			     struct inode *inode);
+
+static int valid_utf8(struct inode * dir, struct dentry * dentry)
+{
+	int i, value;
+	const unsigned char *name = dentry->d_name.name;
+	if (!EXT4_HAS_RO_COMPAT_FEATURE(dir->i_sb,
+					EXT4_FEATURE_RO_COMPAT_UTF8ONLY))
+		/* File system has no restriction wrt. UTF-8. */
+		return 1;
+	/* Check whether file name is UTF-8 encoded. */
+	for (i = 0; i < dentry->d_name.len; i++) {
+		if (name[i] < 128)
+			/* ASCII */
+			continue;
+		if (name[i] < 0xc2)
+			/* 0x80..0xBF: unexpected continuation byte.
+			 * 0xC0, 0xC1: non-shortest 2-byte form.
+			 */
+			return -EILSEQ;
+		if (name[i] < 0xe0) {
+			/* Expecting one more byte */
+			i++;
+			if (i >= dentry->d_name.len)
+				return 0;
+			if (name[i] < 0x80 || name[i] > 0xBF)
+				return 0;
+			continue;
+		}
+		if (name[i] < 0xf0) {
+			/* Expecting two more continuation bytes */
+			if (i+2 >= dentry->d_name.len)
+				return 0;
+			if (((name[i+1] & 0xc0) != 0x80) ||
+			    ((name[i+2] & 0xc0) != 0x80))
+				return 0;
+			/* Decode */
+			value = ((name[i] & 0xf) << 12) +
+				((name[i+1] & 0x3f) << 6) +
+				(name[i+2] & 0x3f);
+			if (value < 0x800)
+				/* Non-shortest form */
+				return 0;
+			if (value >= 0xd800 && value <= 0xdfff)
+				/* UTF-8 encoded surrogates */
+				return 0;
+			i += 2;
+			continue;
+		}
+		if (name[i] < 0xf5) {
+			/* Three continuation bytes */
+			if (i+3 >= dentry->d_name.len)
+				return 0;
+			if (((name[i+1] & 0xc0) != 0x80) ||
+			    ((name[i+3] & 0xc0) != 0x80) ||
+			    ((name[i+2] & 0xc0) != 0x80))
+				return 0;
+			/* Decode */
+			value = ((name[i] & 0x7) << 18) +
+				((name[i+1] & 0x3f) << 12) +
+				((name[i+2] & 0x3f) << 6) +
+				(name[i+3] & 0x3f);
+			if (value < 0x10000)
+				/* Non-shortest form */
+				return 0;
+			if (value >= 0x110000)
+				/* Out of UTF-16 range */
+				return 0;
+			i += 3;
+			continue;
+		}
+		/* Out of UTF-16 range */
+		return 0;
+	}
+	return 1;
+}
 
 /*
  * p is at least 6 bytes before the end of page
@@ -1743,6 +1820,9 @@ static int ext4_create(struct inode *dir, struct dentry *dentry, umode_t mode,
 	struct inode *inode;
 	int err, retries = 0;
 
+	if (!valid_utf8(dir, dentry))
+		return -EILSEQ;
+
 	dquot_initialize(dir);
 
 retry:
@@ -1778,6 +1858,9 @@ static int ext4_mknod(struct inode *dir, struct dentry *dentry,
 
 	if (!new_valid_dev(rdev))
 		return -EINVAL;
+
+	if (!valid_utf8(dir, dentry))
+		return -EILSEQ;
 
 	dquot_initialize(dir);
 
@@ -1817,6 +1900,9 @@ static int ext4_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
 
 	if (EXT4_DIR_LINK_MAX(dir))
 		return -EMLINK;
+
+	if (!valid_utf8(dir, dentry))
+		return -EILSEQ;
 
 	dquot_initialize(dir);
 
@@ -2247,6 +2333,9 @@ static int ext4_symlink(struct inode *dir,
 	if (l > dir->i_sb->s_blocksize)
 		return -ENAMETOOLONG;
 
+	if (!valid_utf8(dir, dentry))
+		return -EILSEQ;
+
 	dquot_initialize(dir);
 
 	if (l > EXT4_N_BLOCKS * 4) {
@@ -2352,6 +2441,9 @@ static int ext4_link(struct dentry *old_dentry,
 	if (inode->i_nlink >= EXT4_LINK_MAX)
 		return -EMLINK;
 
+	if (!valid_utf8(dir, dentry))
+		return -EILSEQ;
+
 	dquot_initialize(dir);
 
 retry:
@@ -2396,6 +2488,9 @@ static int ext4_rename(struct inode *old_dir, struct dentry *old_dentry,
 	struct buffer_head *old_bh, *new_bh, *dir_bh;
 	struct ext4_dir_entry_2 *old_de, *new_de;
 	int retval, force_da_alloc = 0;
+
+	if (!valid_utf8(new_dir, new_dentry))
+		return -EILSEQ;
 
 	dquot_initialize(old_dir);
 	dquot_initialize(new_dir);
